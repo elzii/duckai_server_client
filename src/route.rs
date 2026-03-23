@@ -26,13 +26,13 @@ pub async fn models(
 
     let model_data = vec![
         serde_json::json!({
-            "id": "gpt-4o-mini",
+            "id": "gpt-5-mini",
             "object": "model",
             "created": 1686935002,
             "owned_by": "openai",
         }),
         serde_json::json!({
-            "id": "gpt-5-mini",
+            "id": "gpt-4o-mini",
             "object": "model",
             "created": 1686935002,
             "owned_by": "openai",
@@ -50,7 +50,7 @@ pub async fn models(
             "owned_by": "meta",
         }),
         serde_json::json!({
-            "id": "claude-3.5-haiku",
+            "id": "claude-haiku-4-5",
             "object": "model",
             "created": 1686935002,
             "owned_by": "claude",
@@ -90,7 +90,9 @@ pub async fn chat_completions(
         }
     }
     let token = token.ok_or_else(|| Error::BadRequest("cannot get token".to_string()))?;
-    body.compress_messages();
+    if body.model == "gpt-5-mini" && body.reasoning_effort.is_none() {
+        body.reasoning_effort = Some("minimal".to_string());
+    }
     let (_, response) = send_request(&state.client, token, &body).await?;
     Ok(response)
 }

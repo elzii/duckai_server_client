@@ -16,10 +16,14 @@ pub struct ChatRequest {
     pub model: String,
     #[serde(deserialize_with = "deserialize_message")]
     pub messages: Vec<Message>,
+    #[serde(
+        rename = "reasoningEffort",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing, default)]
     pub stream: Option<bool>,
-    #[serde(skip_serializing, default)]
-    pub compressed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, TypedBuilder)]
@@ -50,11 +54,11 @@ where
 {
     let model = String::deserialize(deserializer)?;
     let model = match model.as_str() {
-        "gpt-4o-mini" => "gpt-4o-mini",
         "gpt-5-mini" => "gpt-5-mini",
+        "gpt-4o-mini" => "gpt-4o-mini",
         "gpt-oss-120b" => "openai/gpt-oss-120b",
         "llama-4-scout" => "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        "claude-3.5-haiku" => "claude-3-5-haiku-latest",
+        "claude-haiku-4-5" => "claude-haiku-4-5",
         "mixtral-small-3" => "mistralai/Mistral-Small-24B-Instruct-2501",
         _ => model.as_str(),
     };
@@ -74,39 +78,6 @@ where
         }
     }
     Ok(message)
-}
-
-pub fn compress_messages(messages: &[Message]) -> String {
-    let mut key = String::new();
-    for message in messages {
-        if let (Some(role), Some(msg)) = (&message.role, &message.content) {
-            let role = serde_json::to_string(&role).unwrap();
-            let role = role.trim_matches('"');
-            match msg {
-                Content::Text(msg) => key.push_str(&format!("{role}:{msg};\n")),
-                Content::Vec(vec) => {
-                    for item in vec {
-                        key.push_str(&format!("{role}:{};\n", item.text));
-                    }
-                }
-            }
-        }
-    }
-    key
-}
-
-impl ChatRequest {
-    pub fn compress_messages(&mut self) {
-        if self.messages.len() > 1 || self.compressed {
-            self.messages = vec![
-                Message::builder()
-                    .role(Role::User)
-                    .content(Content::Text(compress_messages(&self.messages)))
-                    .build(),
-            ];
-            self.compressed = true;
-        }
-    }
 }
 
 // ==================== Duck APi Response Body ====================
