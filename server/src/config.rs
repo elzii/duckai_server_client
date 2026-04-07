@@ -35,7 +35,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             debug: false,
-            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3919),
             timeout: 60,
             connect_timeout: 10,
             tcp_keepalive: Some(90),
