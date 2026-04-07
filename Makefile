@@ -1,4 +1,4 @@
-.PHONY: all build server client copy clean
+.PHONY: all build server client copy clean tidy
 
 # Default job
 all: build
@@ -18,6 +18,11 @@ client:
 	fi
 	python3.11.11 -m pip install -r client/requirements.txt
 
+install: server client copy
+	cp -v ./duckai-server /usr/local/bin/duckai-server
+	cp -v ./duckai-client /usr/local/bin/duckai
+
+
 # Copy binaries to root
 copy:
 	cp server/target/release/duckai ./duckai-server
@@ -26,4 +31,8 @@ copy:
 # Clean build artifacts
 clean:
 	rm -rfv server/target
+	rm -fv duckai-server duckai-client
+	
+## Remove copied binaries
+tidy:
 	rm -fv duckai-server duckai-client
