@@ -2,7 +2,7 @@
 debug: true
 
 # Listen address
-bind: 0.0.0.0:3919
+bind: 127.0.0.1:3919
 
 # Client timeout
 timeout: 60

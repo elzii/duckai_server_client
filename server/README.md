@@ -21,7 +21,7 @@ make
 - 🦀 **RUST** &nbsp;&nbsp;Server 
   - Depenencies: `argh`, `axum`, `tokio`, `serde`, `reqwest`
 - 🐍 **PYTHON** Client
-  - Depenencies: `python-toolkit`, `requests`
+  - Depenencies: `python-toolkit`, `requests`, `pyyaml`
 
 
 ### 🐙 Forked Repo

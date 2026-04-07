@@ -1,5 +1,7 @@
 #!/usr/bin/env python3.11.11
 
+# import sys
+import yaml
 import os
 import time
 import json
@@ -7,7 +9,7 @@ import threading
 import itertools
 import subprocess
 import requests
-
+from pathlib import Path as path
 from prompt_toolkit.application import Application
 from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float, ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -29,6 +31,24 @@ DUCK_ART = """\x1b[38;5;222m      __    \x1b[38;5;208m____  _   _  ____ _  __   
 
 DUCK_LINES = DUCK_ART.split('\n')
 PARSED_DUCK = [ANSI(line).__pt_formatted_text__() for line in DUCK_LINES]
+
+DUCK_DEFAULT_SERVER_ADDR = 'http://127.0.0.1:3919'
+DUCK_SERVER_ADDR: str
+
+def read_from_config(file_path='duckai.yaml'):
+    global DUCK_SERVER_ADDR, DUCK_DEFAULT_SERVER_PORT
+    # Check if the file exists
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as file:
+            try:
+                # Parse YAML into a Python object (usually a dict or list)
+                data = yaml.safe_load(file)
+                DUCK_SERVER_ADDR = data.get("bind", DUCK_DEFAULT_SERVER_ADDR)
+            except yaml.YAMLError as exc:
+                print(f"Error parsing YAML: {exc}")
+    else:
+        print(f"File not found: {file_path}")
+
 
 class ChatLexer(Lexer):
     """Custom lexer to render the ASCII art and colorize user/bot prefixes."""
@@ -66,8 +86,9 @@ class AppState:
         self.spinner_frame = '⠋'
 
     def fetch_models(self):
+        global DUCK_SERVER_ADDR
         try:
-            response = requests.get('http://127.0.0.1:8080/v1/models', timeout=2)
+            response = requests.get(f"{DUCK_SERVER_ADDR}/v1/models", timeout=2)
             data = response.json().get("data", [])
             self.models = [m["id"] for m in data]
             if self.models and self.model not in self.models:
@@ -76,10 +97,11 @@ class AppState:
             self.models = ["gpt-4o-mini", "llama-4-scout", "gpt-oss-120b", "claude-haiku-4-5", "mixtral-small-3"]
 
     def start_status_poller(self, server_process, app_ref):
+        global DUCK_SERVER_ADDR
         def poll():
             while not self._stop_polling.is_set():
                 try:
-                    res = requests.get('http://127.0.0.1:8080/v1/models', timeout=1)
+                    res = requests.get("{DUCK_SERVER_ADDR}/v1/models", timeout=1)
                     new_state = "ONLINE" if res.status_code == 200 else "OFFLINE"
                 except requests.RequestException:
                     if server_process and server_process.poll() is None:
@@ -115,7 +137,8 @@ def main():
     state = AppState()
     
     # --- 1. STARTUP SERVER ---
-    exe_path = os.path.expanduser("./duckai-server") or os.path.expanduser("/usr/local/bin/duckai-server")
+    script_dir = path(__file__).parent.resolve()
+    exe_path = os.path.expanduser(path.joinpath(script_dir, "./duckai-server"))
     if os.path.exists(exe_path):
         server_process = subprocess.Popen(
             [exe_path, 'run'], 
@@ -209,9 +232,10 @@ def main():
         
         # Execute network request asynchronously
         def make_request():
+            global DUCK_SERVER_ADDR
             try:
                 response = requests.post(
-                    'http://127.0.0.1:8080/v1/chat/completions',
+                    f"{DUCK_SERVER_ADDR}/v1/chat/completions",
                     json={"messages": messages, "model": state.model, "stream": True},
                     stream=True, timeout=10
                 )
