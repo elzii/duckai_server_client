@@ -1,0 +1,374 @@
+#!/usr/bin/env python3.11.11
+
+import os
+import time
+import json
+import threading
+import itertools
+import subprocess
+import requests
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float, ConditionalContainer
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.layout import Layout
+from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.formatted_text import ANSI, FormattedText
+from prompt_toolkit.styles import Style
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.lexers import Lexer
+
+# --- 1. DUCK ART PARSING ---
+# We parse the ANSI once so the TUI engine can render it cleanly in the history buffer.
+DUCK_ART = """\x1b[38;5;222m      __    \x1b[38;5;208m____  _   _  ____ _  __     \x1b[38;5;141m_    ___ 
+\x1b[38;5;222m  ___( o)>  \x1b[38;5;208m|  _ \\| | | |/ ___| |/ /    \x1b[38;5;141m/ \\  |_ _|
+\x1b[38;5;222m \\ <_. )    \x1b[38;5;208m| | | | |_| | |   | ' /    \x1b[38;5;141m/ _ \\  | | 
+\x1b[38;5;222m  `---'     \x1b[38;5;208m|____/ \\___/ \\____|_|\\_\\  \x1b[38;5;141m/_/ \\_\\|___|\x1b[0m"""
+
+DUCK_LINES = DUCK_ART.split('\n')
+PARSED_DUCK = [ANSI(line).__pt_formatted_text__() for line in DUCK_LINES]
+
+class ChatLexer(Lexer):
+    """Custom lexer to render the ASCII art and colorize user/bot prefixes."""
+    def lex_document(self, document):
+        def get_line(i):
+            # Render the Duck Art at the very top of the chat log
+            if i < len(PARSED_DUCK):
+                return PARSED_DUCK[i]
+            
+            line = document.lines[i]
+            
+            # Slice the string to apply color ONLY to the 4-character prefix ("🦆 ❯ ")
+            # The empty string '' styling defaults the rest of the message to white
+            if line.startswith("🦆 "):
+                return [('class:bot-prefix', line[:4]), ('', line[4:])]
+            elif line.startswith("👤 "):
+                return [('class:user-prefix', line[:4]), ('', line[4:])]
+                
+            return [('', line)]
+        return get_line
+
+class AppState:
+    """Holds the UI state for the TUI application."""
+    def __init__(self):
+        self.models = []
+        self.model = "gpt-4o-mini"
+        self.menu_open = False
+        self.selected_index = 0
+        
+        self.server_state = "STARTING"
+        self._stop_polling = threading.Event()
+        self._poller_thread = None
+        
+        self.is_thinking = False
+        self.spinner_frame = '⠋'
+
+    def fetch_models(self):
+        try:
+            response = requests.get('http://127.0.0.1:8080/v1/models', timeout=2)
+            data = response.json().get("data", [])
+            self.models = [m["id"] for m in data]
+            if self.models and self.model not in self.models:
+                self.model = self.models[0]
+        except Exception:
+            self.models = ["gpt-4o-mini", "llama-4-scout", "gpt-oss-120b", "claude-haiku-4-5", "mixtral-small-3"]
+
+    def start_status_poller(self, server_process, app_ref):
+        def poll():
+            while not self._stop_polling.is_set():
+                try:
+                    res = requests.get('http://127.0.0.1:8080/v1/models', timeout=1)
+                    new_state = "ONLINE" if res.status_code == 200 else "OFFLINE"
+                except requests.RequestException:
+                    if server_process and server_process.poll() is None:
+                        new_state = "STARTING"
+                    else:
+                        new_state = "OFFLINE"
+
+                if new_state != self.server_state:
+                    self.server_state = new_state
+                    if app_ref.is_running:
+                        app_ref.invalidate()
+
+                time.sleep(2)
+        self._poller_thread = threading.Thread(target=poll, daemon=True)
+        self._poller_thread.start()
+
+    def start_spinner(self, app_ref):
+        self.is_thinking = True
+        def spin():
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            while self.is_thinking:
+                self.spinner_frame = next(spinner)
+                if app_ref.is_running:
+                    app_ref.invalidate()
+                time.sleep(0.08)
+        threading.Thread(target=spin, daemon=True).start()
+
+    def stop_spinner(self):
+        self.is_thinking = False
+
+def main():
+    server_process = None
+    state = AppState()
+    
+    # --- 1. STARTUP SERVER ---
+    exe_path = os.path.expanduser("~/Source/RUST/duckai/target/release/duckai")
+    if os.path.exists(exe_path):
+        server_process = subprocess.Popen(
+            [exe_path, 'run'], 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        state.server_state = "STARTING"
+    else:
+        state.server_state = "OFFLINE"
+        
+    state.fetch_models()
+    messages = []
+    
+    # --- 2. TUI COMPONENTS ---
+    # Pre-fill blank lines so the Lexer can overlay the Duck Art
+    initial_log = "\n" * (len(DUCK_LINES) - 1)
+    chat_log = TextArea(
+        text=initial_log,
+        read_only=True,
+        scrollbar=True,
+        lexer=ChatLexer(),
+        wrap_lines=True
+    )
+    
+    input_field = TextArea(
+        height=3,
+        prompt=' ❯ ',
+        multiline=True,
+        wrap_lines=True,
+        style='class:input-field'
+    )
+
+    # --- 3. STYLING ---
+    style = Style.from_dict({
+        'bottom-toolbar': 'noreverse bg:default fg:default',
+        'spacer': 'noreverse bg:default fg:default',
+        'exit-label': 'bg:#ff4500 #111111 bold',   
+        'model-btn': 'bg:#ff4500 #333333 bold',    
+        'menu-item': 'bg:#ffb347 #000000',         
+        'menu-active': 'bg:#ff8c00 #cccccc bold',
+        'status-online': 'noreverse bg:default #00ff00 bold',
+        'status-offline': 'noreverse bg:default #ff0000 bold',
+        'status-starting': 'noreverse bg:default #ffff00 bold',
+        'status-thinking': 'noreverse bg:default #ff8c00 bold', # Orange spinner
+        'user-prefix': 'fg:#54ff9f bold', # SeaGreen
+        'bot-prefix': 'fg:#ff8c00 bold',  # DarkOrange
+        'input-field': 'bg:#111111',      # Slight background distinction for input
+        'border': 'fg:#444444',
+        # Scrollbar styling to achieve a dim white vertical block layout
+        'scrollbar.background': 'bg:#111111',
+        'scrollbar.button': 'bg:#777777', 
+        'scrollbar.arrow': 'bg:#111111 fg:#777777',
+    })
+
+    # --- 4. KEYBINDINGS ---
+    bindings = KeyBindings()
+
+    @bindings.add('c-d')
+    def _(event):
+        event.app.exit()
+
+    @bindings.add('c-c')
+    def _(event):
+        input_field.text = ""
+
+    @bindings.add('enter')
+    def _(event):
+        """Submit text on Enter. Use Alt+Enter for a new line."""
+        if state.menu_open:
+            state.model = state.models[state.selected_index]
+            state.menu_open = False
+            return
+            
+        text = input_field.text
+        if not text.strip(): return
+        
+        # UI Update
+        chat_log.text += f"\n\n👤 ❯ {text}\n🦆 ❯ "
+        # Auto-scroll to bottom
+        chat_log.buffer.cursor_position = len(chat_log.text) 
+        
+        messages.append({"role": "user", "content": text})
+        input_field.text = ""
+        
+        if state.server_state != "ONLINE":
+            chat_log.text += "[!] Server Offline. Cannot send request."
+            messages.pop()
+            return
+            
+        state.start_spinner(event.app)
+        
+        # Execute network request asynchronously
+        def make_request():
+            try:
+                response = requests.post(
+                    'http://127.0.0.1:8080/v1/chat/completions',
+                    json={"messages": messages, "model": state.model, "stream": True},
+                    stream=True, timeout=10
+                )
+                state.stop_spinner()
+                
+                full_reply = ""
+                for line in response.iter_lines():
+                    if line:
+                        decoded = line.decode('utf-8')
+                        if decoded.startswith("data: "):
+                            if "data: [DONE]" in decoded: break
+                            try:
+                                data = json.loads(decoded[6:])
+                                content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                if content:
+                                    chat_log.text += content
+                                    full_reply += content
+                                    # Force scroll to bottom and redraw
+                                    chat_log.buffer.cursor_position = len(chat_log.text)
+                                    if event.app.is_running:
+                                        event.app.invalidate()
+                            except json.JSONDecodeError: continue
+                            
+                messages.append({"role": "assistant", "content": full_reply})
+            except Exception as e:
+                state.stop_spinner()
+                chat_log.text += f"\n[!] Error: {e}"
+                if event.app.is_running: event.app.invalidate()
+
+        threading.Thread(target=make_request, daemon=True).start()
+
+    @bindings.add('escape', 'enter')
+    def _(event):
+        """Alt+Enter to insert a newline in the input field."""
+        input_field.buffer.insert_text('\n')
+
+    # --- SCROLLBACK LOGIC ---
+    @bindings.add('up')
+    def _(event):
+        if state.menu_open:
+            state.selected_index = max(0, state.selected_index - 1)
+        elif event.app.layout.has_focus(input_field):
+            # If cursor is at the top line of the input field, scroll the chat log instead
+            if input_field.document.cursor_position_row == 0:
+                chat_log.buffer.cursor_up(count=3) # Jump 3 lines for faster scrolling
+
+    @bindings.add('down')
+    def _(event):
+        if state.menu_open:
+            state.selected_index = min(len(state.models) - 1, state.selected_index + 1)
+        elif event.app.layout.has_focus(input_field):
+            # Scroll chat log back down if we aren't moving within the input field
+            if input_field.document.cursor_position_row == input_field.document.line_count - 1:
+                chat_log.buffer.cursor_down(count=3)
+
+    @bindings.add('escape', 'm')
+    def _(event):
+        state.menu_open = not state.menu_open
+        state.selected_index = state.models.index(state.model) if state.model in state.models else 0
+
+    for i in range(1, 10):
+        @bindings.add(str(i), filter=Condition(lambda: state.menu_open))
+        def _(event, num=i):
+            idx = num - 1
+            if idx < len(state.models):
+                state.model = state.models[idx]
+                state.menu_open = False
+
+    # --- 5. UI LAYOUT BUILDER ---
+    def get_menu_tokens():
+        tokens = []
+        max_model_len = max((len(m) for m in state.models), default=15)
+        menu_width = max_model_len + 8 
+        for i, model in enumerate(state.models):
+            prefix = "❯" if i == state.selected_index else " "
+            raw_text = f" {i+1}. {model} ".ljust(menu_width - 2)
+            class_name = 'class:menu-active' if i == state.selected_index else 'class:menu-item'
+            tokens.append((class_name, f"{raw_text}{prefix} "))
+            tokens.append(('', '\n')) 
+        return tokens
+
+    def get_bottom_toolbar():
+        term_width = os.get_terminal_size().columns
+        tokens = []
+
+        exit_str = " <Ctrl+D> Exit "
+        model_str = f" Model: {state.model} "
+        
+        if state.is_thinking:
+            status_str = f" {state.spinner_frame} THINKING "
+            status_class = "class:status-thinking"
+        elif state.server_state == "ONLINE":
+            status_str = " 🟢 ONLINE "
+            status_class = "class:status-online"
+        elif state.server_state == "STARTING":
+            status_str = " 🟡 STARTING "
+            status_class = "class:status-starting"
+        else:
+            status_str = " 🔴 OFFLINE "
+            status_class = "class:status-offline"
+
+        left_len = len(exit_str)
+        center_len = len(status_str)
+        right_len = len(model_str)
+
+        left_spacer_len = max(0, (term_width // 2) - left_len - (center_len // 2))
+        right_spacer_len = max(0, term_width - left_len - left_spacer_len - center_len - right_len)
+
+        tokens.append(('class:exit-label', exit_str))
+        tokens.append(('class:spacer', " " * left_spacer_len))
+        tokens.append((status_class, status_str))
+        tokens.append(('class:spacer', " " * right_spacer_len))
+        tokens.append(('class:model-btn', model_str))
+        return tokens
+
+    body = HSplit([
+        chat_log,
+        Window(height=1, char='─', style='class:border'), # The border above the input
+        input_field,
+        Window(content=FormattedTextControl(get_bottom_toolbar), height=1, style='class:bottom-toolbar')
+    ])
+
+    root_container = FloatContainer(
+        content=body,
+        floats=[
+            Float(
+                right=0, bottom=1, # Anchors the menu exactly above the right side of the toolbar
+                content=ConditionalContainer(
+                    content=Window(FormattedTextControl(get_menu_tokens), width=30),
+                    filter=Condition(lambda: state.menu_open)
+                )
+            )
+        ]
+    )
+
+    app = Application(
+        layout=Layout(root_container, focused_element=input_field),
+        key_bindings=bindings,
+        style=style,
+        full_screen=True,
+        mouse_support=False # Controls whether we can click and drag to select
+    )
+
+    state.start_status_poller(server_process, app)
+
+    try:
+        app.run()
+    finally:
+        # --- 6. TEARDOWN ---
+        state._stop_polling.set()
+        if server_process and server_process.poll() is None:
+            print("\nShutting down DuckAI Server...")
+            server_process.terminate()
+            try:
+                server_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server_process.kill()
+
+if __name__ == "__main__":
+    main()
