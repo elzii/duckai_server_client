@@ -1,0 +1,31 @@
+# Debug mode
+debug: true
+
+# Listen address
+bind: 0.0.0.0:3919
+
+# Client timeout
+timeout: 60
+
+# Client connect timeout
+connect_timeout: 10
+
+# Client tcp keepalive
+tcp_keepalive: 90
+
+# Maximum tcp connection
+concurrent: 100
+
+# Proxy pool
+# proxies:
+# - !url http://127.0.0.1:6152
+# - !url socks5://127.0.0.1:6153
+# - !cidr 2001:470:e953::/48
+# - !iface 192.168.1.10
+
+# Enable TLS
+tls_cert: null
+tls_key: null
+
+# API key
+api_key: null
