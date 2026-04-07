@@ -115,7 +115,7 @@ def main():
     state = AppState()
     
     # --- 1. STARTUP SERVER ---
-    exe_path = os.path.expanduser("~/Source/RUST/duckai/target/release/duckai")
+    exe_path = os.path.expanduser("./duckai-server") or os.path.expanduser("/usr/local/bin/duckai-server")
     if os.path.exists(exe_path):
         server_process = subprocess.Popen(
             [exe_path, 'run'], 
