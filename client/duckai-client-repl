@@ -1,0 +1,358 @@
+#!/usr/bin/env python3.11.11
+
+import sys
+import os
+import time
+import json
+import threading
+import itertools
+import subprocess
+import requests
+# from rich.console import Console
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.formatted_text import ANSI, FormattedText
+from prompt_toolkit.styles import Style
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.application import get_app
+from prompt_toolkit.mouse_events import MouseEventType
+
+def clear_terminal():
+    # 'nt' is the name for Windows; 'posix' covers Linux/macOS
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+clear_terminal()
+
+class Spinner:
+    """A threaded spinner to show loading state without blocking execution."""
+    def __init__(self, message="Thinking"):
+        self.spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+        self.stop_running = threading.Event()
+        self.thread = None
+        self.message = message
+
+    def spin(self):
+        while not self.stop_running.is_set():
+            sys.stdout.write(f'\r\033[K\x1b[38;5;208m{next(self.spinner)}\x1b[0m {self.message}')
+            sys.stdout.flush()
+            time.sleep(0.08)
+
+    def start(self):
+        self.thread = threading.Thread(target=self.spin)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_running.set()
+        if self.thread:
+            self.thread.join()
+        sys.stdout.write('\r\033[K') 
+        sys.stdout.flush()
+
+
+class AppState:
+    """Holds the UI state for the application."""
+    def __init__(self):
+        self.models = []
+        self.model = "gpt-4o-mini"
+        self.menu_open = False
+        self.selected_index = 0
+        
+        # State machine for the background server
+        self.server_state = "STARTING"
+        self._stop_polling = threading.Event()
+        self._poller_thread = None
+
+    def fetch_models(self):
+        try:
+            response = requests.get('http://127.0.0.1:8080/v1/models', timeout=2)
+            data = response.json().get("data", [])
+            self.models = [m["id"] for m in data]
+            if self.models and self.model not in self.models:
+                self.model = self.models[0]
+        except Exception:
+            self.models = ["gpt-4o-mini", "llama-4-scout", "gpt-oss-120b", "claude-haiku-4-5", "mixtral-small-3"]
+
+    def start_status_poller(self, server_process):
+        """Starts a background thread to check if the server is healthy."""
+        def poll():
+            while not self._stop_polling.is_set():
+                try:
+                    res = requests.get('http://127.0.0.1:8080/v1/models', timeout=1)
+                    new_state = "ONLINE" if res.status_code == 200 else "OFFLINE"
+                except requests.RequestException:
+                    # If HTTP fails, check if the process is alive at the OS level
+                    if server_process and server_process.poll() is None:
+                        new_state = "STARTING"
+                    else:
+                        new_state = "OFFLINE"
+
+                # If status changed, update state and force UI redraw
+                if new_state != self.server_state:
+                    self.server_state = new_state
+                    try:
+                        app = get_app()
+                        if app and app.is_running:
+                            app.invalidate()
+                    except Exception:
+                        pass # get_app() might fail during early startup/shutdown
+
+                time.sleep(2) # Poll every 2 seconds
+
+        self._poller_thread = threading.Thread(target=poll, daemon=True)
+        self._poller_thread.start()
+
+    def stop_status_poller(self):
+        self._stop_polling.set()
+
+
+def main():
+    server_process = None
+    state = AppState()
+    
+    try:
+        # --- 1. STARTUP BACKGROUND SERVER ---
+        exe_path = os.path.expanduser("~/Source/RUST/duckai/target/release/duckai")
+        if os.path.exists(exe_path):
+            server_process = subprocess.Popen(
+                [exe_path, 'run'], 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+            state.server_state = "STARTING"
+        else:
+            print(f"\x1b[31m[!] Warning: Server executable not found at {exe_path}\x1b[0m")
+            state.server_state = "OFFLINE"
+            
+        # Start the UI Poller and pass the subprocess reference
+        state.start_status_poller(server_process)
+        state.fetch_models()
+        
+        # console = Console()
+        messages = []
+        
+        # --- STYLING ---
+        style = Style.from_dict({
+            'bottom-toolbar': 'noreverse bg:default fg:default',
+            'spacer': 'noreverse bg:default fg:default',
+            'exit-label': 'bg:#ff4500 #111111 bold',   
+            'model-btn': 'bg:#ff4500 #333333 bold',    
+            'menu-item': 'bg:#ffb347 #000000',         
+            'menu-active': 'bg:#ff8c00 #cccccc bold',
+            # Dynamic Status Colors
+            'status-online': 'noreverse bg:default #00ff00 bold',   # Green
+            'status-offline': 'noreverse bg:default #ff0000 bold',  # Red
+            'status-starting': 'noreverse bg:default #ffff00 bold', # Yellow
+        })
+
+        bindings = KeyBindings()
+
+        @Condition
+        def is_menu_open():
+            return state.menu_open
+
+        @bindings.add('escape', 'm')
+        def toggle_menu(event):
+            state.menu_open = not state.menu_open
+            state.selected_index = state.models.index(state.model) if state.model in state.models else 0
+            event.app.invalidate()
+
+        @bindings.add('escape', filter=is_menu_open)
+        def close_menu(event):
+            state.menu_open = False
+            event.app.invalidate()
+
+        @bindings.add('up', filter=is_menu_open)
+        def menu_up(event):
+            state.selected_index = max(0, state.selected_index - 1)
+
+        @bindings.add('down', filter=is_menu_open)
+        def menu_down(event):
+            state.selected_index = min(len(state.models) - 1, state.selected_index + 1)
+
+        @bindings.add('enter', filter=is_menu_open)
+        def menu_select(event):
+            state.model = state.models[state.selected_index]
+            state.menu_open = False
+            event.app.invalidate()
+
+        for i in range(1, 10):
+            @bindings.add(str(i), filter=is_menu_open)
+            def menu_quick_select(event, num=i):
+                idx = num - 1
+                if idx < len(state.models):
+                    state.model = state.models[idx]
+                    state.menu_open = False
+                    event.app.invalidate()
+
+        @bindings.add('<any>', filter=is_menu_open)
+        def swallow_keys(event):
+            pass
+
+        def mouse_toggle_menu(mouse_event):
+            if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                state.menu_open = not state.menu_open
+                get_app().invalidate()
+
+        def get_bottom_toolbar():
+            term_width = get_app().output.get_size().columns
+            tokens = []
+
+            # 1. Render Menu Box
+            if state.menu_open:
+                max_model_len = max((len(m) for m in state.models), default=15)
+                menu_width = max_model_len + 8 
+                
+                for i, model in enumerate(state.models):
+                    prefix = "❯" if i == state.selected_index else " "
+                    raw_text = f" {i+1}. {model} ".ljust(menu_width - 2)
+                    item_text = f"{raw_text}{prefix} "
+                    
+                    spacer_len = max(0, term_width - len(item_text))
+                    spacer = " " * spacer_len
+                    
+                    class_name = 'class:menu-active' if i == state.selected_index else 'class:menu-item'
+                    
+                    tokens.append(('class:spacer', spacer))
+                    tokens.append((class_name, item_text))
+                    tokens.append(('', '\n')) 
+
+            # 2. Render Main Toolbar Row
+            exit_str = " <Ctrl+D> to Exit "
+            model_str = f" Model: {state.model} "
+            
+            # Map state to UI representation
+            if state.server_state == "ONLINE":
+                status_str = " 🟢 ONLINE "
+                status_class = "class:status-online"
+            elif state.server_state == "STARTING":
+                status_str = " 🟡 STARTING SERVER "
+                status_class = "class:status-starting"
+            else:
+                status_str = " 🔴 OFFLINE "
+                status_class = "class:status-offline"
+
+            # Math to achieve absolute centering of the status label
+            left_len = len(exit_str)
+            center_len = len(status_str)
+            right_len = len(model_str)
+
+            left_spacer_len = max(0, (term_width // 2) - left_len - (center_len // 2))
+            right_spacer_len = max(0, term_width - left_len - left_spacer_len - center_len - right_len)
+
+            tokens.append(('class:exit-label', exit_str))
+            tokens.append(('class:spacer', " " * left_spacer_len))
+            tokens.append((status_class, status_str))
+            tokens.append(('class:spacer', " " * right_spacer_len))
+            tokens.append(('class:model-btn', model_str, mouse_toggle_menu))
+            
+            return FormattedText(tokens)
+
+        session = PromptSession(
+            bottom_toolbar=get_bottom_toolbar,
+            key_bindings=bindings,
+            style=style,
+            mouse_support=True 
+        )
+        
+
+
+        # --- 1. DUCK ART PARSING ---
+        # We parse the ANSI once so the TUI engine can render it cleanly in the history buffer.
+        DUCK_ART = """
+        \x1b[38;5;222m      __    \x1b[38;5;208m ____  _   _  ____ _  __     \x1b[38;5;141m_    ___ 
+        \x1b[38;5;222m  ___( o)>  \x1b[38;5;208m|  _ \\| | | |/ ___| |/ /    \x1b[38;5;141m/ \\  |_ _|
+        \x1b[38;5;222m \\ <_. )    \x1b[38;5;208m| | | | |_| | |   | ' /    \x1b[38;5;141m/ _ \\  | | 
+        \x1b[38;5;222m  `---'     \x1b[38;5;208m|____/ \\___/ \\____|_|\\_\\  \x1b[38;5;141m/_/ \\_\\|___|\x1b[0m"""
+
+        print_formatted_text(ANSI(DUCK_ART), style=style)
+        
+        while True:
+            try:
+                term_width = get_app().output.get_size().columns
+                white_border = "\x1b[97m" 
+                reset = "\x1b[0m"
+                
+                top_border = f"{white_border}┌{'─' * (term_width - 2)}{reset}"
+                colored_user_prompt_string = f"\n{top_border}\n{white_border}│{reset} \033[38;5;84m❯ \033[0m"
+                
+                user_input = session.prompt(ANSI(colored_user_prompt_string))
+
+                if not user_input.strip():
+                    continue
+                if user_input.strip().lower() in ['exit', 'quit']:
+                    break
+                    
+                messages.append({"role": "user", "content": user_input})
+                
+                # Protect request logic dynamically based on state string
+                if state.server_state != "ONLINE":
+                    print(f"\x1b[31m[!] Cannot send request: Server is {state.server_state}.\x1b[0m\n")
+                    messages.pop() 
+                    continue
+
+                spinner = Spinner()
+                spinner.start()
+                
+                response = requests.post(
+                    'http://127.0.0.1:8080/v1/chat/completions',
+                    json={
+                        "messages": messages, 
+                        "model": state.model, 
+                        "stream": True
+                    },
+                    stream=True,
+                    timeout=10
+                )
+                
+                spinner.stop()
+                
+                colored_bot_prompt_string = "\x1b[38;5;208m ❮ \033[0m"
+                sys.stdout.write(colored_bot_prompt_string)
+                sys.stdout.flush()
+                
+                full_reply = ""
+                
+                for line in response.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith("data: "):
+                            if "data: [DONE]" in decoded_line:
+                                break
+                                
+                            json_str = decoded_line[6:] 
+                            try:
+                                data = json.loads(json_str)
+                                content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                
+                                if content:
+                                    sys.stdout.write(content)
+                                    sys.stdout.flush()
+                                    full_reply += content
+                                    
+                            except json.JSONDecodeError:
+                                continue
+                                
+                print("\n") 
+                messages.append({"role": "assistant", "content": full_reply})
+                
+            except KeyboardInterrupt:
+                continue
+            except EOFError:
+                break
+            except requests.exceptions.RequestException as e:
+                spinner.stop()
+                print(f"\n[!] Connection Error: {e}\n")
+
+    finally:
+        # --- 2. TEARDOWN BACKGROUND SERVER ---
+        state.stop_status_poller()
+        if server_process and server_process.poll() is None:
+            print("\nShutting down DuckAI Server...")
+            server_process.terminate()
+            try:
+                server_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server_process.kill()
+
+if __name__ == "__main__":
+    main()

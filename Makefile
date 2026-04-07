@@ -1,5 +1,8 @@
 .PHONY: all build server client copy clean tidy
 
+# Env variable for TUI or REPL client
+TYPE := $(CLIENT_TYPE)
+
 # Default job
 all: build
 
@@ -20,13 +23,14 @@ client:
 
 install: server client copy
 	cp -v ./duckai-server /usr/local/bin/duckai-server
-	cp -v ./duckai-client /usr/local/bin/duckai
+	cp -v ./duckai-client-tui /usr/local/bin/duckai
 
 
 # Copy binaries to root
 copy:
 	cp server/target/release/duckai ./duckai-server
-	cp client/duckai-client ./duckai-client
+	cp client/duckai-client-repl ./duckai-client-repl
+	cp client/duckai-client-tui ./duckai-client-tui
 
 # Clean build artifacts
 clean:

@@ -1,5 +1,7 @@
 server/target
 server/Cargo.lock
 */duckai.yaml
-duckai-server
-duckai-client
+/duckai-server
+/duckai-client
+/duckai-client-tui
+/duckai-client-repl
